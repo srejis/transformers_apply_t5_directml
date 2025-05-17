@@ -1265,7 +1265,6 @@ class T5Stack(T5PreTrainedModel):
         return causal_mask
 
     @staticmethod
-    # Copied from transformers.models.llama.modeling_llama.LlamaPreTrainedModel._prepare_4d_causal_attention_mask_with_cache_position
     def _prepare_4d_causal_attention_mask_with_cache_position(
         attention_mask: torch.Tensor,
         sequence_length: int,
@@ -1275,50 +1274,48 @@ class T5Stack(T5PreTrainedModel):
         batch_size: int,
         **kwargs,
     ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
-                `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache,
-                to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-        """
         if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
+            device = cache_position.device
             min_dtype = torch.finfo(dtype).min
+
+            # float causal mask (same as original)
             causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=cache_position.device
+                (sequence_length, target_length),
+                fill_value=0.0,  # ⚠️ 초기값은 0.0
+                dtype=dtype,
+                device=device
             )
+
+            # upper triangular part → masked
             if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=cache_position.device) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
-                    causal_mask.device
+                causal_mask = causal_mask.masked_fill(
+                    torch.triu(torch.ones_like(causal_mask, dtype=torch.bool), diagonal=1),
+                    min_dtype
                 )
-                padding_mask = padding_mask == 0
+
+            # mask with position
+            position_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask * (~position_mask).to(dtype)
+
+            # reshape to [batch, 1, tgt, src]
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+
+            # pad mask 처리
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()
+                mask_length = attention_mask.shape[-1]
+
+                # ✅ 여기 핵심 수정: padding_mask → bool
+                padding_mask = (causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)) == 0
+
                 causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
                     padding_mask, min_dtype
                 )
 
         return causal_mask
+
 
 
 # Warning message for FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
